@@ -11,8 +11,17 @@ from typing import Any, Dict, List, Optional, Tuple
 from shapely.geometry import Polygon
 
 from .db import Database
-from .geometry import GeometryError, build_polygon, merge_intervals, segment_inside_params
-from .timeutils import TimeError, clip_intervals_halfopen, merge_windows, parse_utc, subtract_intervals_halfopen, validate_window
+from .geometry import GeometryError, build_polygon, segment_inside_params
+from .timeutils import (
+    TimeError,
+    clip_intervals_halfopen,
+    merge_halfopen,
+    merge_windows,
+    parse_utc,
+    snap_to_anchors,
+    subtract_intervals_halfopen,
+    validate_window,
+)
 
 
 class ConflictError(Exception):
@@ -770,7 +779,10 @@ class AuditService:
 
         沿用既有规则：带洞边界（外边界计入、洞及其边界不计）、区域 UTC 半开
         生效窗口、相邻轨迹点线性插值、零时长接触不计、相接区间合并；
-        再与查询范围 [lo, hi) 做半开求交。
+        再按区域窗口与查询范围 [lo, hi) 的真实半开交集裁剪。
+
+        严格半开语义：正时长空档（即使仅相隔 1 微秒的两个生效窗口之间）必须
+        切断占用，窗口外时间不计入穿越时长；仅端点数学相等（相接）时才合并。
         """
         polygon = Polygon(
             json.loads(zrow["exterior"]),
@@ -778,6 +790,16 @@ class AuditService:
         )
         windows_raw = json.loads(zrow["windows"])
         windows = merge_windows([(w["start_epoch"], w["end_epoch"]) for w in windows_raw])
+
+        # 规范时刻锚点：采样点时刻、区域窗口边界、查询范围边界。
+        # 端点先吸附到锚点再做严格相等的相接判定，吸收浮点末位舍入差异，
+        # 同时保证任何正时长（≥1 微秒）空档都不会被跨越。
+        anchors: List[float] = [p["ts_epoch"] for p in points]
+        anchors.extend(t for w in windows for t in w)
+        if lo is not None:
+            anchors.append(lo)
+        if hi is not None:
+            anchors.append(hi)
 
         # 覆盖参数（时间）区间：遍历相邻点，乱序已在 SQL 层按时刻排序重建
         cover: List[Tuple[float, float]] = []
@@ -796,13 +818,14 @@ class AuditService:
                 if e - s > self.min_duration:
                     cover.append((s, e))
 
-        # 时间域合并留 1e-6 秒容差，吸收不同时刻解析路径的浮点误差
-        cover = merge_intervals(cover, eps=1e-6)
+        # 同一边界在不同计算路径下的末位差异先吸附到规范锚点；
+        # 仅重叠或端点相接才合并，正时长空档（含 1 微秒窗口间隙）保留切断。
+        cover = merge_halfopen(cover, anchors)
         intervals = clip_intervals_halfopen(cover, windows)
         if lo is not None or hi is not None:
             bounds = [(-float("inf") if lo is None else lo, float("inf") if hi is None else hi)]
             intervals = clip_intervals_halfopen(intervals, bounds)
-        intervals = merge_intervals(intervals, eps=1e-6)
+        intervals = merge_halfopen(intervals, anchors)
         return [(s, e) for s, e in intervals if e - s > self.min_duration]
 
     def _crossing_for_zone(
@@ -962,8 +985,8 @@ class AuditService:
                     weight = max(weight, zone_weights[zid])
             if weight <= 0.0:
                 continue
-            # 相接（1e-6 秒容差）且权重相同的区间合并
-            if pieces and pieces[-1][2] == weight and a - pieces[-1][1] <= 1e-6:
+            # 仅端点相接且权重连续相同的区间合并；正时长空档（占用中断）切断
+            if pieces and pieces[-1][2] == weight and a == pieces[-1][1]:
                 pieces[-1][1] = b
             else:
                 pieces.append([a, b, weight])
@@ -1169,13 +1192,13 @@ class AuditService:
             tied = sorted(zid for zid in active if zone_limits[zid] == limit)
             if speed <= limit:
                 continue  # 必须严格大于限速才违规
-            # 相接（1e-6 秒容差）且速度/限速/并列限速区集合一致的区间合并
+            # 仅端点相接且速度/限速/并列限速区集合连续一致的区间合并
             if (
                 violations
                 and violations[-1][2] == speed
                 and violations[-1][3] == limit
                 and violations[-1][4] == tied
-                and a - violations[-1][1] <= 1e-6
+                and a == violations[-1][1]
             ):
                 violations[-1][1] = b
             else:
@@ -1349,9 +1372,9 @@ class AuditService:
                 if any(s <= mid < e for s, e in ivs)
             )
             if len(occupants) < threshold:
-                continue
-            if segments and segments[-1][2] == occupants and a - segments[-1][1] <= 1e-6:
-                segments[-1][1] = b  # 相邻同集合：合并
+                continue  # 正时长空档（占用不足）必须切断，不跨空档合并
+            if segments and segments[-1][2] == occupants and a == segments[-1][1]:
+                segments[-1][1] = b  # 仅端点相接且车次集合连续相同：合并
             else:
                 segments.append([a, b, occupants])
 
@@ -1497,6 +1520,11 @@ class AuditService:
 
         # ---- 无序车次对：仅在两车同时位于区内时比较同一时刻平面距离 ----
         points_by_trip = {tid: points for tid, _version, points in per_trip}
+        # 窗口/查询边界是切断相遇的规范锚点：1 微秒窗口空档保持分离
+        time_anchors: List[float] = [lo, hi]
+        time_anchors.extend(
+            t for w in json.loads(zrow["windows"]) for t in (w["start_epoch"], w["end_epoch"])
+        )
         pairs: List[Dict[str, Any]] = []
         for i in range(len(trip_ids)):
             for j in range(i + 1, len(trip_ids)):
@@ -1504,7 +1532,11 @@ class AuditService:
                 # 两车覆盖区间的半开交集：双方均有轨迹覆盖且同时位于区内的时间
                 common = clip_intervals_halfopen(coverage[tid_a], coverage[tid_b])
                 intervals = self._encounter_intervals(
-                    points_by_trip[tid_a], points_by_trip[tid_b], common, max_distance
+                    points_by_trip[tid_a],
+                    points_by_trip[tid_b],
+                    common,
+                    max_distance,
+                    anchors=time_anchors,
                 )
                 if not intervals:
                     continue
@@ -1548,16 +1580,23 @@ class AuditService:
         points_b: List[Any],
         common: List[Tuple[float, float]],
         max_distance: float,
+        anchors: Optional[List[float]] = None,
     ) -> List[Tuple[float, float, float]]:
         """两车公共在区时间内、平面距离严格小于阈值的正时长区间（含区间最小距离）。
 
         把公共区间按两车轨迹点时刻切成原子段：每段内两车各自线性运动，
         相对位置随时间线性变化，距离平方为开口向上抛物线，解析求严格小于
-        阈值的子区间；相接（端点重合）且连续满足条件的区间合并，最小距离
-        取各段最小；零时长触及不产生区间。
+        阈值的子区间；零时长触及不产生区间。
+
+        合并规则（严格半开）：正时长空档必须切断相遇——包括区域窗口之间的
+        1 微秒空档（common 本身已被窗口切断）与距离暂时不小于阈值的空档；
+        仅当两段端点数学相等（端点相接）且相接时刻距离仍严格小于阈值
+        （条件连续）时才合并，最小距离取各段最小；相接时刻距离恰等于阈值
+        时条件不连续，保持分离。
         """
         ts_a = [r["ts_epoch"] for r in points_a]
         ts_b = [r["ts_epoch"] for r in points_b]
+        anchor_set = list(anchors or ()) + ts_a + ts_b
         candidates: List[Tuple[float, float, float]] = []
         for s, e in common:
             cuts = {s, e}
@@ -1574,15 +1613,38 @@ class AuditService:
                 )
                 if piece is not None:
                     candidates.append(piece)
-        # 时间域合并留 1e-6 秒容差，吸收不同时刻解析路径的浮点误差
+        # 仅端点相接（吸附到规范锚点后数学相等）且相接点条件连续（严格小于
+        # 阈值）才合并；任何正时长空档（含 1 微秒窗口间隙）保持分离。
         merged: List[List[float]] = []
-        for s, e, min_d in candidates:
-            if merged and s - merged[-1][1] <= 1e-6:
+        for s_raw, e_raw, min_d in candidates:
+            s = snap_to_anchors(s_raw, anchor_set)
+            e = snap_to_anchors(e_raw, anchor_set)
+            if (
+                merged
+                and s == merged[-1][1]
+                and self._distance_at(
+                    points_a, ts_a, points_b, ts_b, s
+                )
+                < max_distance
+            ):
                 merged[-1][1] = max(merged[-1][1], e)
                 merged[-1][2] = min(merged[-1][2], min_d)
             else:
                 merged.append([s, e, min_d])
         return [(s, e, md) for s, e, md in merged if e - s > self.min_duration]
+
+    def _distance_at(
+        self,
+        points_a: List[Any],
+        ts_a: List[float],
+        points_b: List[Any],
+        ts_b: List[float],
+        t: float,
+    ) -> float:
+        """两车在同一时刻 t 线性插值位置的平面距离。"""
+        ax, ay = self._position_at(points_a, ts_a, t)
+        bx, by = self._position_at(points_b, ts_b, t)
+        return math.hypot(ax - bx, ay - by)
 
     def _close_interval_on_piece(
         self,
@@ -1766,16 +1828,25 @@ class AuditService:
 
         # ---- 无序车次对相遇区间：沿用近距离相遇的插值/窗口/带洞/严格小于阈值规则 ----
         points_by_trip = {tid: points for tid, _version, points in per_trip}
+        # 窗口/查询边界是切断相遇的规范锚点：1 微秒空档不会被跨越，传递不提前
+        time_anchors: List[float] = [lo, hi]
+        time_anchors.extend(
+            t for w in json.loads(zrow["windows"]) for t in (w["start_epoch"], w["end_epoch"])
+        )
         adjacency: Dict[str, List[Tuple[str, List[Tuple[float, float]]]]] = {}
         for i in range(len(trip_ids)):
             for j in range(i + 1, len(trip_ids)):
                 tid_a, tid_b = trip_ids[i], trip_ids[j]
                 common = clip_intervals_halfopen(coverage[tid_a], coverage[tid_b])
-                # _encounter_intervals 已保证正时长且按起点升序合并
+                # _encounter_intervals 已保证正时长、按起点升序且不跨正时长空档合并
                 intervals = [
                     (s, e)
                     for s, e, _min_d in self._encounter_intervals(
-                        points_by_trip[tid_a], points_by_trip[tid_b], common, max_distance
+                        points_by_trip[tid_a],
+                        points_by_trip[tid_b],
+                        common,
+                        max_distance,
+                        anchors=time_anchors,
                     )
                 ]
                 if intervals:
