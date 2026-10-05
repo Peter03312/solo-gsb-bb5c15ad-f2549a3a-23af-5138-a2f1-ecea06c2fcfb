@@ -796,13 +796,17 @@ class AuditService:
                 if e - s > self.min_duration:
                     cover.append((s, e))
 
-        # 时间域合并留 1e-6 秒容差，吸收不同时刻解析路径的浮点误差
-        cover = merge_intervals(cover, eps=1e-6)
+        # 时间域合并：仅重叠或端点恰好相接（半开 [s,e) 与 [e,e')）才合并；
+        # 相隔正时长（哪怕 1 微秒）的两段必须保持分离，窗口外时间不得计入。
+        # 相邻轨迹段在公共采样点取同一浮点时刻，端点相接是精确相等，无需容差。
+        cover = merge_intervals(cover, eps=0.0)
         intervals = clip_intervals_halfopen(cover, windows)
         if lo is not None or hi is not None:
             bounds = [(-float("inf") if lo is None else lo, float("inf") if hi is None else hi)]
             intervals = clip_intervals_halfopen(intervals, bounds)
-        intervals = merge_intervals(intervals, eps=1e-6)
+        # 与区域窗口、查询范围的真实半开交集后同样只合并恰好端点相接的段：
+        # 正时长空档（如两个仅相隔 1 微秒的生效窗口之间）必须切断占用。
+        intervals = merge_windows(intervals)
         return [(s, e) for s, e in intervals if e - s > self.min_duration]
 
     def _crossing_for_zone(
@@ -962,8 +966,8 @@ class AuditService:
                     weight = max(weight, zone_weights[zid])
             if weight <= 0.0:
                 continue
-            # 相接（1e-6 秒容差）且权重相同的区间合并
-            if pieces and pieces[-1][2] == weight and a - pieces[-1][1] <= 1e-6:
+            # 仅端点恰好相接且权重相同的区间合并；正时长空档必须切断
+            if pieces and pieces[-1][2] == weight and a == pieces[-1][1]:
                 pieces[-1][1] = b
             else:
                 pieces.append([a, b, weight])
@@ -1169,13 +1173,14 @@ class AuditService:
             tied = sorted(zid for zid in active if zone_limits[zid] == limit)
             if speed <= limit:
                 continue  # 必须严格大于限速才违规
-            # 相接（1e-6 秒容差）且速度/限速/并列限速区集合一致的区间合并
+            # 仅端点恰好相接且速度/限速/并列限速区集合一致的区间合并；
+            # 正时长空档（如生效窗口间 1 微秒的间隔）必须切断
             if (
                 violations
                 and violations[-1][2] == speed
                 and violations[-1][3] == limit
                 and violations[-1][4] == tied
-                and a - violations[-1][1] <= 1e-6
+                and a == violations[-1][1]
             ):
                 violations[-1][1] = b
             else:
@@ -1350,7 +1355,7 @@ class AuditService:
             )
             if len(occupants) < threshold:
                 continue
-            if segments and segments[-1][2] == occupants and a - segments[-1][1] <= 1e-6:
+            if segments and segments[-1][2] == occupants and a == segments[-1][1]:
                 segments[-1][1] = b  # 相邻同集合：合并
             else:
                 segments.append([a, b, occupants])
@@ -1574,10 +1579,12 @@ class AuditService:
                 )
                 if piece is not None:
                     candidates.append(piece)
-        # 时间域合并留 1e-6 秒容差，吸收不同时刻解析路径的浮点误差
+        # 仅在重叠或端点恰好相接（前一段终点 == 后一段起点，且两段都满足条件，
+        # 即“条件连续”）时合并；正时长空档必须切断——即使仅相隔 1 微秒，
+        # 空档内可能有车驶出生效窗口/穿洞，不得把两段相遇连成一段
         merged: List[List[float]] = []
         for s, e, min_d in candidates:
-            if merged and s - merged[-1][1] <= 1e-6:
+            if merged and s <= merged[-1][1]:
                 merged[-1][1] = max(merged[-1][1], e)
                 merged[-1][2] = min(merged[-1][2], min_d)
             else:
